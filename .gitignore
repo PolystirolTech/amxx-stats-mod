@@ -1,0 +1,28 @@
+# Compiled AMXX files
+*.amxx
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Editor specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*_flymake.*
+*_flymake
+
+# OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
