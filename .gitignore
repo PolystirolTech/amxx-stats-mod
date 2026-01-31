@@ -1,5 +1,6 @@
 # Compiled AMXX files
 *.amxx
+compiled/
 
 # Backup files
 *.bak
@@ -25,4 +26,3 @@ desktop.ini
 # Temporary files
 *.tmp
 *.temp
-
