@@ -28,11 +28,12 @@
 #define MAX_NAME_LENGTH 64
 #define MAX_MAP_NAME 32
 #define MAX_WEAPON_NAME 32
-#define MAX_UUID_LENGTH 36
+#define MAX_UUID_LENGTH 37
 #define MAX_URL_LENGTH 256
-#define MAX_JSON_SIZE 8192
+#define MAX_JSON_SIZE 32768
 #define MAX_BATCH_SIZE 100
 #define MAX_QUEUE_FILES 100
+#define MAX_REQUEST_SIZE 40960
 
 // Rate limiting
 #define MIN_SEND_INTERVAL 5.0
@@ -83,29 +84,18 @@ enum _:FPSInfo {
 	FI_MAP_NAME[MAX_MAP_NAME]
 }
 
-// Forward declarations
+enum _:CounterInfo {
+	CI_STEAMID[MAX_STEAMID_LENGTH],
+	CI_SERVER_UUID[MAX_UUID_LENGTH],
+	CI_SHOTS,
+	CI_HITS,
+	CI_DAMAGE,
+	CI_JUMPS
+}
+
+// Public API and Event Handlers
 forward OnClientConnect(id);
 forward OnClientPutInServer(id);
 forward OnClientDisconnect(id);
 forward OnPlayerKilled(victim, attacker, headshot);
-forward CollectFPSMetrics();
-forward SendServerInfo();
-forward AddToBatch(type, const data[], size);
-forward FlushBatch(type);
-forward BuildBatchPayload(output[], maxlen);
-forward SendStatisticsBatch(const payload[]);
-forward ParseAPIResponse(const response[]);
-forward HandleAPIError(const error[], const payload[]);
-forward SaveToRetryQueue(const payload[]);
-forward ProcessRetryQueue();
-forward CleanOldQueueFiles();
-forward GetSteamID(player, output[], len);
-forward GetCurrentTimestamp();
-forward GetServerAddress(output[], len);
-forward ValidateUUID(const uuid[]);
-forward EscapeJSONString(const input[], output[], len);
-forward LoadConfig();
-forward Float:GetConfigFloat(const key[], Float:def);
-forward GetConfigString(const key[], output[], len, const def[]);
-forward GetConfigInt(const key[], def);
 

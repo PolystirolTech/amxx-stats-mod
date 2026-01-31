@@ -17,7 +17,14 @@
 
 #define PLUGIN_NAME "Stats Mod"
 #define PLUGIN_VERSION "1.0.0"
-#define PLUGIN_AUTHOR "Your Name"
+#define PLUGIN_AUTHOR "Sluicee"
+
+#pragma dynamic 131072
+
+// Global buffers to avoid stack overflow
+new g_JsonBuffer[MAX_JSON_SIZE]
+new g_PayloadBuffer[MAX_JSON_SIZE]
+new g_RequestBuffer[MAX_REQUEST_SIZE]
 
 // Configuration variables
 new g_StatsEnabled = 1
@@ -27,16 +34,18 @@ new Float:g_FpsInterval = 60.0
 new Float:g_SessionInterval = 600.0
 new g_KillsBatchSize = 10
 new Float:g_KillsInterval = 30.0
-new Float:g_RetryDelay = 10.0
+new g_StatsDebug = 0
 
 // Batch queues
 new Array:g_UsersQueue
 new Array:g_SessionsQueue
 new Array:g_KillsQueue
 new Array:g_FpsQueue
+new Array:g_CountersQueue
 
 // Session tracking
 new g_PlayerSessions[33][SessionInfo]
+new g_PlayerCounters[33][CounterInfo]
 new g_PlayerConnected[33]
 new g_PlayerFirstConnect[33]
 
@@ -54,15 +63,34 @@ new g_RetryTimer = 0
 new g_ServerInfo[ServerInfo]
 new g_ServerInfoSent = 0
 
+new const g_WeaponClassnames[][] = {
+	"weapon_p228", "weapon_scout", "weapon_xm1014", "weapon_mac10", "weapon_aug", "weapon_elite",
+	"weapon_fiveseven", "weapon_ump45", "weapon_sg550", "weapon_galil", "weapon_famas", "weapon_usp",
+	"weapon_glock18", "weapon_awp", "weapon_mp5navy", "weapon_m249", "weapon_m3", "weapon_m4a1",
+	"weapon_tmp", "weapon_g3sg1", "weapon_deagle", "weapon_sg552", "weapon_ak47", "weapon_p90"
+}
+
 public plugin_init()
 {
 	register_plugin(PLUGIN_NAME, PLUGIN_VERSION, PLUGIN_AUTHOR);
+	
+	// Create data directory
+	new dataDir[128]
+	formatex(dataDir, charsmax(dataDir), "addons/amxmodx/data/stats_mod")
+	if (!dir_exists(dataDir))
+	{
+		mkdir(dataDir)
+	}
+	
+	DebugLogToFile("--- Plugin Initialization Started ---")
+	server_print("[Stats Mod] plugin_init started. Logging to addons/amxmodx/data/stats_mod/debug.log")
 	
 	// Initialize arrays
 	g_UsersQueue = ArrayCreate(UserInfo)
 	g_SessionsQueue = ArrayCreate(SessionInfo)
 	g_KillsQueue = ArrayCreate(KillInfo)
 	g_FpsQueue = ArrayCreate(FPSInfo)
+	g_CountersQueue = ArrayCreate(CounterInfo)
 	
 	// Load configuration
 	LoadConfig()
@@ -70,14 +98,30 @@ public plugin_init()
 	// Check if enabled
 	if (!g_StatsEnabled)
 	{
+		DebugLogToFile("Plugin is DISABLED in config.")
+		server_print("[Stats Mod] Plugin is DISABLED via config.")
 		return
 	}
 	
 	// Validate UUID
 	if (!ValidateUUID(g_ServerUUID))
 	{
-		log_amx("[Stats Mod] Invalid server UUID: %s", g_ServerUUID)
+		new msg[128]
+		formatex(msg, charsmax(msg), "[Stats Mod] ERROR: Invalid/Missing server UUID: '%s'.", g_ServerUUID)
+		DebugLogToFile(msg)
+		server_print(msg)
+		set_fail_state(msg)
 		return
+	}
+	
+	DebugLogToFile("Config loaded successfully. UUID: %s", g_ServerUUID)
+	
+	if (containi(g_ApiUrl, "https://") != -1)
+	{
+		server_print("[Stats Mod] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+		server_print("[Stats Mod] ERROR: HTTPS is NOT supported! Use http:// instead.")
+		server_print("[Stats Mod] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+		DebugLogToFile("CRITICAL: HTTPS detected in API URL. Sockets will fail.")
 	}
 	
 	// Initialize server info
@@ -86,6 +130,27 @@ public plugin_init()
 	// Register hooks
 	RegisterHam(Ham_TakeDamage, "player", "OnPlayerTakeDamage")
 	RegisterHam(Ham_Killed, "player", "OnPlayerKilled", 1)
+	RegisterHam(Ham_Player_Jump, "player", "OnPlayerJump", 1)
+	
+	new modname[32]
+	get_modname(modname, charsmax(modname))
+	public TaskHeartbeat()
+{
+	// Removed for production
+}
+	if (equal(modname, "cstrike") || equal(modname, "czero"))
+	{
+		for (new i = 0; i < sizeof g_WeaponClassnames; i++)
+		{
+			RegisterHam(Ham_Weapon_PrimaryAttack, g_WeaponClassnames[i], "OnPrimaryAttack", 1)
+		}
+	}
+	else if (equal(modname, "valve"))
+	{
+		RegisterHam(Ham_Weapon_PrimaryAttack, "weapon_9mmhandgun", "OnPrimaryAttack", 1)
+		RegisterHam(Ham_Weapon_PrimaryAttack, "weapon_mp5", "OnPrimaryAttack", 1)
+	}
+	
 	register_event("DeathMsg", "OnDeathMsg", "a")
 	
 	// Create queue directory
@@ -95,11 +160,13 @@ public plugin_init()
 	{
 		mkdir(queuePath)
 	}
+	
+	log_amx("[Stats Mod] Plugin initialized successfully.")
 }
 
 public plugin_precache()
 {
-	// Precache resources if needed
+	// No noise in production
 }
 
 public plugin_cfg()
@@ -133,6 +200,7 @@ public plugin_end()
 	ArrayDestroy(g_SessionsQueue)
 	ArrayDestroy(g_KillsQueue)
 	ArrayDestroy(g_FpsQueue)
+	ArrayDestroy(g_CountersQueue)
 }
 
 // Configuration loading
@@ -141,10 +209,20 @@ LoadConfig()
 	new configPath[128]
 	formatex(configPath, charsmax(configPath), "%s", CONFIG_FILE)
 	
+	server_print("[Stats Mod] Loading config from: %s", configPath)
+	
 	if (!file_exists(configPath))
 	{
-		log_amx("[Stats Mod] Config file not found: %s", configPath)
-		return
+		// Try fallback to amxmodx/configs/
+		formatex(configPath, charsmax(configPath), "addons/amxmodx/configs/stats_mod.cfg")
+		server_print("[Stats Mod] Not found, trying: %s", configPath)
+		
+		if (!file_exists(configPath))
+		{
+			server_print("[Stats Mod] ERROR: Config file NOT FOUND! Plugin will not work.")
+			log_amx("[Stats Mod] Config file not found")
+			return
+		}
 	}
 	
 	g_StatsEnabled = GetConfigInt("stats_enabled", 1)
@@ -154,7 +232,7 @@ LoadConfig()
 	g_SessionInterval = GetConfigFloat("stats_session_interval", 600.0)
 	g_KillsBatchSize = GetConfigInt("stats_kills_batch_size", 10)
 	g_KillsInterval = GetConfigFloat("stats_kills_interval", 30.0)
-	g_RetryDelay = GetConfigFloat("stats_retry_delay", 10.0)
+	g_StatsDebug = GetConfigInt("stats_debug", 0)
 }
 
 GetConfigInt(const key[], def)
@@ -253,11 +331,12 @@ GetConfigString(const key[], output[], len, const def[])
 		trim(value)
 		
 		// Remove quotes if present
-		if (value[0] == '"' && value[strlen(value) - 1] == '"')
+		new valLen = strlen(value)
+		if (valLen >= 2 && value[0] == '"' && value[valLen - 1] == '"')
 		{
+			value[valLen - 1] = 0
 			new temp[256]
 			copy(temp, charsmax(temp), value[1])
-			temp[strlen(temp) - 1] = 0
 			copy(value, charsmax(value), temp)
 		}
 		
@@ -327,6 +406,9 @@ StartTimers()
 	if (g_RetryTimer)
 		remove_task(g_RetryTimer)
 	g_RetryTimer = set_task(30.0, "TaskProcessRetryQueue", _, _, _, "b")
+	
+	// Counters timer
+	set_task(60.0, "TaskFlushCounters", _, _, _, "b")
 }
 
 // Client connection hooks
@@ -384,6 +466,14 @@ public client_putinserver(id)
 		g_PlayerSessions[id][SE_KILLS] = 0
 		g_PlayerSessions[id][SE_DEATHS] = 0
 		g_PlayerSessions[id][SE_HEADSHOTS] = 0
+		
+		// Reset counters
+		copy(g_PlayerCounters[id][CI_STEAMID], charsmax(g_PlayerCounters[][CI_STEAMID]), authid)
+		copy(g_PlayerCounters[id][CI_SERVER_UUID], charsmax(g_PlayerCounters[][CI_SERVER_UUID]), g_ServerUUID)
+		g_PlayerCounters[id][CI_SHOTS] = 0
+		g_PlayerCounters[id][CI_HITS] = 0
+		g_PlayerCounters[id][CI_DAMAGE] = 0
+		g_PlayerCounters[id][CI_JUMPS] = 0
 	}
 }
 
@@ -416,7 +506,31 @@ public client_disconnect(id)
 // Kill tracking
 public OnPlayerTakeDamage(victim, inflictor, attacker, Float:damage, damagebits)
 {
-	// Tracked in OnPlayerKilled
+	if (!g_StatsEnabled || !IsValidPlayer(attacker) || !IsValidPlayer(victim))
+		return
+	
+	if (attacker == victim)
+		return
+		
+	g_PlayerCounters[attacker][CI_HITS]++
+	g_PlayerCounters[attacker][CI_DAMAGE] += floatround(damage)
+}
+
+public OnPrimaryAttack(weapon)
+{
+	new id = pev(weapon, pev_owner)
+	if (IsValidPlayer(id))
+	{
+		g_PlayerCounters[id][CI_SHOTS]++
+	}
+}
+
+public OnPlayerJump(id)
+{
+	if (IsValidPlayer(id))
+	{
+		g_PlayerCounters[id][CI_JUMPS]++
+	}
 }
 
 public OnPlayerKilled(victim, attacker, shouldgib)
@@ -464,7 +578,7 @@ public OnDeathMsg()
 		copy(killInfo[KI_KILLER_STEAMID], charsmax(killInfo[KI_KILLER_STEAMID]), attackerSteamID)
 		
 		new weaponName[MAX_WEAPON_NAME]
-		get_weaponname(read_data(4), weaponName, charsmax(weaponName))
+		read_data(4, weaponName, charsmax(weaponName))
 		copy(killInfo[KI_WEAPON], charsmax(killInfo[KI_WEAPON]), weaponName)
 	}
 	else
@@ -518,7 +632,7 @@ CollectFPSMetrics()
 			fps = 100.0 // Fallback
 		}
 	}
-	fpsInfo[FI_FPS] = fps
+	fpsInfo[_:FI_FPS] = _:fps
 	
 	// Count online players
 	fpsInfo[FI_PLAYERS_ONLINE] = 0
@@ -578,6 +692,38 @@ public TaskFlushKills()
 	}
 }
 
+public TaskFlushCounters()
+{
+	if (!g_StatsEnabled)
+		return
+		
+	for (new i = 1; i <= get_maxplayers(); i++)
+	{
+		if (g_PlayerConnected[i])
+		{
+			new counterInfo[CounterInfo]
+			for (new j = 0; j < CounterInfo; j++)
+			{
+				counterInfo[j] = g_PlayerCounters[i][j]
+			}
+			
+			// Only push if there's something to report
+			if (counterInfo[CI_SHOTS] > 0 || counterInfo[CI_JUMPS] > 0)
+			{
+				AddToBatch(BATCH_TYPE_COUNTERS, counterInfo, CounterInfo)
+				
+				// Reset after batching
+				g_PlayerCounters[i][CI_SHOTS] = 0
+				g_PlayerCounters[i][CI_HITS] = 0
+				g_PlayerCounters[i][CI_DAMAGE] = 0
+				g_PlayerCounters[i][CI_JUMPS] = 0
+			}
+		}
+	}
+	
+	FlushBatch(BATCH_TYPE_COUNTERS)
+}
+
 // Server info sending
 public SendServerInfo()
 {
@@ -625,6 +771,10 @@ AddToBatch(type, const data[], size)
 		{
 			// Servers are sent immediately, no queue
 		}
+		case BATCH_TYPE_COUNTERS:
+		{
+			ArrayPushArray(g_CountersQueue, data)
+		}
 	}
 }
 
@@ -641,11 +791,10 @@ FlushBatch(type)
 		return
 	}
 	
-	new payload[MAX_JSON_SIZE]
-	if (BuildBatchPayload(payload, charsmax(payload)))
+	if (BuildBatchPayload(g_PayloadBuffer, MAX_JSON_SIZE))
 	{
 		g_SendingInProgress = 1
-		SendStatisticsBatch(payload)
+		SendStatisticsBatch(g_PayloadBuffer)
 		g_LastSendTime = currentTime
 	}
 }
@@ -665,110 +814,128 @@ BuildBatchPayload(output[], maxlen)
 	if (strlen(g_ApiUrl) == 0 || strlen(g_ServerUUID) == 0)
 		return 0
 	
-	new json[MAX_JSON_SIZE]
 	new pos = 0
 	
 	// Start JSON object
-	copy(json, maxlen, "{")
-	add(json, maxlen, "^"server_uuid^":^"")
-	add(json, maxlen, g_ServerUUID)
-	add(json, maxlen, "^"")
-	pos = strlen(json)
+	copy(g_JsonBuffer, maxlen, "{")
+	add(g_JsonBuffer, maxlen, "^"server_uuid^":^"")
+	add(g_JsonBuffer, maxlen, g_ServerUUID)
+	add(g_JsonBuffer, maxlen, "^"")
+	pos = strlen(g_JsonBuffer)
 	
 	// Servers array
 	if (g_ServerInfoSent)
 	{
-		add(json, maxlen, ",^"servers^":[")
-		pos = strlen(json)
-		pos += BuildServerJSON(json[pos], maxlen - pos, g_ServerInfo)
-		add(json, maxlen, "]")
-		pos = strlen(json)
+		add(g_JsonBuffer, maxlen, ",^"servers^":[")
+		pos = strlen(g_JsonBuffer)
+		pos += BuildServerJSON(g_JsonBuffer[pos], maxlen - pos, g_ServerInfo)
+		add(g_JsonBuffer, maxlen, "]")
+		pos = strlen(g_JsonBuffer)
 	}
 	
 	// Users array
 	new usersCount = ArraySize(g_UsersQueue)
 	if (usersCount > 0)
 	{
-		add(json, maxlen, ",^"users^":[")
-		pos = strlen(json)
+		add(g_JsonBuffer, maxlen, ",^"users^":[")
+		pos = strlen(g_JsonBuffer)
 		for (new i = 0; i < usersCount; i++)
 		{
-			if (i > 0) add(json, maxlen, ",")
+			if (i > 0) add(g_JsonBuffer, maxlen, ",")
 			new userInfo[UserInfo]
 			ArrayGetArray(g_UsersQueue, i, userInfo)
-			pos = strlen(json)
-			pos += BuildUserJSON(json[pos], maxlen - pos, userInfo)
+			pos = strlen(g_JsonBuffer)
+			pos += BuildUserJSON(g_JsonBuffer[pos], maxlen - pos, userInfo)
 		}
-		add(json, maxlen, "]")
+		add(g_JsonBuffer, maxlen, "]")
 		ArrayClear(g_UsersQueue)
-		pos = strlen(json)
+		pos = strlen(g_JsonBuffer)
 	}
 	
 	// Sessions array
 	new sessionsCount = ArraySize(g_SessionsQueue)
 	if (sessionsCount > 0)
 	{
-		add(json, maxlen, ",^"sessions^":[")
-		pos = strlen(json)
+		add(g_JsonBuffer, maxlen, ",^"sessions^":[")
+		pos = strlen(g_JsonBuffer)
 		for (new i = 0; i < sessionsCount; i++)
 		{
-			if (i > 0) add(json, maxlen, ",")
+			if (i > 0) add(g_JsonBuffer, maxlen, ",")
 			new sessionInfo[SessionInfo]
 			ArrayGetArray(g_SessionsQueue, i, sessionInfo)
-			pos = strlen(json)
-			pos += BuildSessionJSON(json[pos], maxlen - pos, sessionInfo)
+			pos = strlen(g_JsonBuffer)
+			pos += BuildSessionJSON(g_JsonBuffer[pos], maxlen - pos, sessionInfo)
 		}
-		add(json, maxlen, "]")
+		add(g_JsonBuffer, maxlen, "]")
 		ArrayClear(g_SessionsQueue)
-		pos = strlen(json)
+		pos = strlen(g_JsonBuffer)
 	}
 	
 	// Kills array
 	new killsCount = ArraySize(g_KillsQueue)
 	if (killsCount > 0)
 	{
-		add(json, maxlen, ",^"kills^":[")
-		pos = strlen(json)
+		add(g_JsonBuffer, maxlen, ",^"kills^":[")
+		pos = strlen(g_JsonBuffer)
 		for (new i = 0; i < killsCount; i++)
 		{
-			if (i > 0) add(json, maxlen, ",")
+			if (i > 0) add(g_JsonBuffer, maxlen, ",")
 			new killInfo[KillInfo]
 			ArrayGetArray(g_KillsQueue, i, killInfo)
-			pos = strlen(json)
-			pos += BuildKillJSON(json[pos], maxlen - pos, killInfo)
+			pos = strlen(g_JsonBuffer)
+			pos += BuildKillJSON(g_JsonBuffer[pos], maxlen - pos, killInfo)
 		}
-		add(json, maxlen, "]")
+		add(g_JsonBuffer, maxlen, "]")
 		ArrayClear(g_KillsQueue)
-		pos = strlen(json)
+		pos = strlen(g_JsonBuffer)
 	}
 	
 	// FPS array
 	new fpsCount = ArraySize(g_FpsQueue)
 	if (fpsCount > 0)
 	{
-		add(json, maxlen, ",^"fps^":[")
-		pos = strlen(json)
+		add(g_JsonBuffer, maxlen, ",^"fps^":[")
+		pos = strlen(g_JsonBuffer)
 		for (new i = 0; i < fpsCount; i++)
 		{
-			if (i > 0) add(json, maxlen, ",")
+			if (i > 0) add(g_JsonBuffer, maxlen, ",")
 			new fpsInfo[FPSInfo]
 			ArrayGetArray(g_FpsQueue, i, fpsInfo)
-			pos = strlen(json)
-			pos += BuildFPSJSON(json[pos], maxlen - pos, fpsInfo)
+			pos = strlen(g_JsonBuffer)
+			pos += BuildFPSJSON(g_JsonBuffer[pos], maxlen - pos, fpsInfo)
 		}
-		add(json, maxlen, "]")
+		add(g_JsonBuffer, maxlen, "]")
 		ArrayClear(g_FpsQueue)
-		pos = strlen(json)
+		pos = strlen(g_JsonBuffer)
+	}
+	
+	// Counters array
+	new countersCount = ArraySize(g_CountersQueue)
+	if (countersCount > 0)
+	{
+		add(g_JsonBuffer, maxlen, ",^"counters^":[")
+		pos = strlen(g_JsonBuffer)
+		for (new i = 0; i < countersCount; i++)
+		{
+			if (i > 0) add(g_JsonBuffer, maxlen, ",")
+			new counterInfo[CounterInfo]
+			ArrayGetArray(g_CountersQueue, i, counterInfo)
+			pos = strlen(g_JsonBuffer)
+			pos += BuildCounterJSON(g_JsonBuffer[pos], maxlen - pos, counterInfo)
+		}
+		add(g_JsonBuffer, maxlen, "]")
+		ArrayClear(g_CountersQueue)
+		pos = strlen(g_JsonBuffer)
 	}
 	
 	// Close JSON object
-	add(json, maxlen, "}")
-	pos = strlen(json)
+	add(g_JsonBuffer, maxlen, "}")
+	pos = strlen(g_JsonBuffer)
 	
 	if (pos >= maxlen - 1)
 		return 0
 	
-	copy(output, maxlen, json)
+	copy(output, maxlen, g_JsonBuffer)
 	return 1
 }
 
@@ -804,7 +971,7 @@ BuildUserJSON(output[], maxlen, const userInfo[UserInfo])
 	add(output, maxlen, "^",^"name^":^"")
 	add(output, maxlen, escapedName)
 	new registeredStr[32]
-	num_to_str(userInfo[UI_REGISTERED], registeredStr, charsmax(registeredStr))
+	formatex(registeredStr, charsmax(registeredStr), "%d000", userInfo[UI_REGISTERED])
 	add(output, maxlen, "^",^"registered^":")
 	add(output, maxlen, registeredStr)
 	add(output, maxlen, "}")
@@ -826,10 +993,10 @@ BuildSessionJSON(output[], maxlen, const sessionInfo[SessionInfo])
 	add(output, maxlen, "^",^"map_name^":^"")
 	add(output, maxlen, escapedMap)
 	new tempStr[32]
-	num_to_str(sessionInfo[SE_SESSION_START], tempStr, charsmax(tempStr))
+	formatex(tempStr, charsmax(tempStr), "%d000", sessionInfo[SE_SESSION_START])
 	add(output, maxlen, "^",^"session_start^":")
 	add(output, maxlen, tempStr)
-	num_to_str(sessionInfo[SE_SESSION_END], tempStr, charsmax(tempStr))
+	formatex(tempStr, charsmax(tempStr), "%d000", sessionInfo[SE_SESSION_END])
 	add(output, maxlen, ",^"session_end^":")
 	add(output, maxlen, tempStr)
 	num_to_str(sessionInfo[SE_KILLS], tempStr, charsmax(tempStr))
@@ -876,7 +1043,7 @@ BuildKillJSON(output[], maxlen, const killInfo[KillInfo])
 	add(output, maxlen, "^",^"headshot^":")
 	add(output, maxlen, killInfo[KI_HEADSHOT] ? "true" : "false")
 	new dateStr[32]
-	num_to_str(killInfo[KI_DATE], dateStr, charsmax(dateStr))
+	formatex(dateStr, charsmax(dateStr), "%d000", killInfo[KI_DATE])
 	add(output, maxlen, ",^"date^":")
 	add(output, maxlen, dateStr)
 	add(output, maxlen, "}")
@@ -891,11 +1058,11 @@ BuildFPSJSON(output[], maxlen, const fpsInfo[FPSInfo])
 	copy(output, maxlen, "{^"server_uuid^":^"")
 	add(output, maxlen, fpsInfo[FI_SERVER_UUID])
 	new tempStr[32]
-	num_to_str(fpsInfo[FI_DATE], tempStr, charsmax(tempStr))
+	formatex(tempStr, charsmax(tempStr), "%d000", fpsInfo[FI_DATE])
 	add(output, maxlen, "^",^"date^":")
 	add(output, maxlen, tempStr)
 	new fpsStr[32]
-	float_to_str(fpsInfo[FI_FPS], fpsStr, charsmax(fpsStr))
+	float_to_str(Float:fpsInfo[FI_FPS], fpsStr, charsmax(fpsStr))
 	add(output, maxlen, ",^"fps^":")
 	add(output, maxlen, fpsStr)
 	num_to_str(fpsInfo[FI_PLAYERS_ONLINE], tempStr, charsmax(tempStr))
@@ -904,6 +1071,35 @@ BuildFPSJSON(output[], maxlen, const fpsInfo[FPSInfo])
 	add(output, maxlen, ",^"map_name^":^"")
 	add(output, maxlen, escapedMap)
 	add(output, maxlen, "^"}")
+	return strlen(output)
+}
+
+BuildCounterJSON(output[], maxlen, const counterInfo[CounterInfo])
+{
+	copy(output, maxlen, "{^"steam_id^":^"")
+	add(output, maxlen, counterInfo[CI_STEAMID])
+	add(output, maxlen, "^",^"server_uuid^":^"")
+	add(output, maxlen, counterInfo[CI_SERVER_UUID])
+	add(output, maxlen, "^",^"counters^":{")
+	
+	new temp[32]
+	num_to_str(counterInfo[CI_SHOTS], temp, charsmax(temp))
+	add(output, maxlen, "^"shots^":")
+	add(output, maxlen, temp)
+	
+	num_to_str(counterInfo[CI_HITS], temp, charsmax(temp))
+	add(output, maxlen, ",^"hits^":")
+	add(output, maxlen, temp)
+	
+	num_to_str(counterInfo[CI_DAMAGE], temp, charsmax(temp))
+	add(output, maxlen, ",^"damage^":")
+	add(output, maxlen, temp)
+	
+	num_to_str(counterInfo[CI_JUMPS], temp, charsmax(temp))
+	add(output, maxlen, ",^"jumps^":")
+	add(output, maxlen, temp)
+	
+	add(output, maxlen, "}}")
 	return strlen(output)
 }
 
@@ -978,68 +1174,89 @@ SendStatisticsBatch(const payload[])
 	new host[128], path[256], port = 80
 	new urlCopy[MAX_URL_LENGTH]
 	copy(urlCopy, charsmax(urlCopy), g_ApiUrl)
+	trim(urlCopy)
+	
+	DebugLogToFile("Parsing URL: %s", urlCopy)
 	
 	// Remove protocol
-	if (strfind(urlCopy, "https://", true) == 0)
+	new pos = strfind(urlCopy, "://")
+	if (pos != -1)
 	{
-		port = 443
-		copy(urlCopy, charsmax(urlCopy), urlCopy[8])
-	}
-	else if (strfind(urlCopy, "http://", true) == 0)
-	{
-		copy(urlCopy, charsmax(urlCopy), urlCopy[7])
+		if (containi(urlCopy, "https") != -1) port = 443
+		
+		new temp[MAX_URL_LENGTH]
+		copy(temp, charsmax(temp), urlCopy[pos + 3])
+		copy(urlCopy, charsmax(urlCopy), temp)
 	}
 	
 	// Extract path (everything after first /)
-	new pathPos = strfind(urlCopy, "/")
-	if (pathPos != -1)
+	pos = strfind(urlCopy, "/")
+	if (pos != -1)
 	{
-		copy(path, charsmax(path), urlCopy[pathPos])
-		urlCopy[pathPos] = 0
+		copy(path, charsmax(path), urlCopy[pos])
+		urlCopy[pos] = 0
+		
+		// If path is just "/", use default endpoint
+		if (equal(path, "/"))
+		{
+			formatex(path, charsmax(path), "%s", API_ENDPOINT)
+		}
 	}
 	else
 	{
 		formatex(path, charsmax(path), "%s", API_ENDPOINT)
 	}
 	
-	// Extract port from host
-	new portPos = strfind(urlCopy, ":")
-	if (portPos != -1)
+	// Extract port from remains of urlCopy (which is now just the host[:port])
+	pos = strfind(urlCopy, ":")
+	if (pos != -1)
 	{
 		new portStr[16]
-		copy(portStr, charsmax(portStr), urlCopy[portPos + 1])
+		copy(portStr, charsmax(portStr), urlCopy[pos + 1])
 		port = str_to_num(portStr)
-		urlCopy[portPos] = 0
+		urlCopy[pos] = 0
 	}
 	
 	// Copy remaining as host
 	copy(host, charsmax(host), urlCopy)
 	
 	// Build HTTP request
-	new request[4096]
 	new reqPos = 0
 	
-	reqPos += formatex(request[reqPos], charsmax(request) - reqPos, "POST %s HTTP/1.1\r\n", path)
-	reqPos += formatex(request[reqPos], charsmax(request) - reqPos, "Host: %s\r\n", host)
-	reqPos += formatex(request[reqPos], charsmax(request) - reqPos, "Content-Type: application/json\r\n")
-	reqPos += formatex(request[reqPos], charsmax(request) - reqPos, "Content-Length: %d\r\n", strlen(payload))
-	reqPos += formatex(request[reqPos], charsmax(request) - reqPos, "Connection: close\r\n")
-	reqPos += formatex(request[reqPos], charsmax(request) - reqPos, "\r\n")
-	reqPos += formatex(request[reqPos], charsmax(request) - reqPos, "%s", payload)
+	reqPos += formatex(g_RequestBuffer[reqPos], MAX_REQUEST_SIZE - reqPos, "POST %s HTTP/1.0^r^n", path)
+	reqPos += formatex(g_RequestBuffer[reqPos], MAX_REQUEST_SIZE - reqPos, "Host: %s^r^n", host)
+	reqPos += formatex(g_RequestBuffer[reqPos], MAX_REQUEST_SIZE - reqPos, "User-Agent: AMXX-StatsMod/1.0^r^n")
+	reqPos += formatex(g_RequestBuffer[reqPos], MAX_REQUEST_SIZE - reqPos, "Content-Type: application/json^r^n")
+	reqPos += formatex(g_RequestBuffer[reqPos], MAX_REQUEST_SIZE - reqPos, "Content-Length: %d^r^n", strlen(payload))
+	reqPos += formatex(g_RequestBuffer[reqPos], MAX_REQUEST_SIZE - reqPos, "Connection: close^r^n")
+	reqPos += formatex(g_RequestBuffer[reqPos], MAX_REQUEST_SIZE - reqPos, "Accept: */*^r^n")
+	reqPos += formatex(g_RequestBuffer[reqPos], MAX_REQUEST_SIZE - reqPos, "^r^n")
+	
+	// Copy payload
+	copy(g_RequestBuffer[reqPos], MAX_REQUEST_SIZE - reqPos, payload)
+	
+	if (g_StatsDebug >= 1)
+	{
+		DebugLogToFile("Sending request to %s:%d%s", host, port, path)
+		// Log the first 500 characters of the request to see the headers
+		new debugReq[512]
+		copy(debugReq, charsmax(debugReq), g_RequestBuffer)
+		DebugLogToFile("Full Request (truncated to 512):^n%s", debugReq)
+	}
 	
 	// Open socket
 	new timeout = floatround(HTTP_TIMEOUT)
 	new socket = socket_open(host, port, SOCKET_TCP, timeout)
 	if (socket == -1)
 	{
-		log_amx("[Stats Mod] Failed to open socket to %s:%d", host, port)
+		DebugLogToFile("CRITICAL: Failed to open socket to %s:%d", host, port)
 		SaveToRetryQueue(payload)
 		g_SendingInProgress = 0
 		return
 	}
 	
 	// Send request
-	socket_send(socket, request, strlen(request))
+	socket_send(socket, g_RequestBuffer, strlen(g_RequestBuffer))
 	
 	// Read response (simplified - read first 1024 bytes)
 	new response[1024]
@@ -1049,11 +1266,12 @@ SendStatisticsBatch(const payload[])
 	
 	if (bytesReceived > 0)
 	{
+		DebugLogToFile("Received %d bytes response", bytesReceived)
 		ParseAPIResponse(response)
 	}
 	else
 	{
-		log_amx("[Stats Mod] No response from server")
+		DebugLogToFile("ERROR: No response received from server (timeout or closed)")
 		SaveToRetryQueue(payload)
 	}
 	
@@ -1062,17 +1280,21 @@ SendStatisticsBatch(const payload[])
 
 ParseAPIResponse(const response[])
 {
+	DebugLogToFile("Full API Response:^n%s", response)
+	
 	// Check for success (200/201)
 	if (containi(response, "HTTP/1.1 200") != -1 || containi(response, "HTTP/1.1 201") != -1)
 	{
-		// Success
 		return
 	}
 	
+	if (containi(response, "HTTP/1.1 301") != -1 || containi(response, "HTTP/1.1 302") != -1)
+	{
+		DebugLogToFile("WARNING: API returned a REDIRECT. HLDS Sockets cannot follow redirects. Use the final URL in config (check if it should be https but we use http).")
+	}
+	
 	// Error - save to retry queue
-	new errorMsg[256]
-	copy(errorMsg, charsmax(errorMsg), response)
-	log_amx("[Stats Mod] API error: %s", errorMsg)
+	log_amx("[Stats Mod] API error: Check debug.log for details")
 }
 
 // Retry queue
@@ -1184,47 +1406,6 @@ public DeleteQueueFile(filepath[])
 	}
 }
 
-CleanOldQueueFiles()
-{
-	// Clean files older than 7 days (simplified - just limit total count)
-	new queuePath[128]
-	formatex(queuePath, charsmax(queuePath), "%s", QUEUE_DIR)
-	
-	if (!dir_exists(queuePath))
-		return
-	
-	new dir = open_dir(queuePath, "", 0)
-	if (!dir)
-		return
-	
-	new files[MAX_QUEUE_FILES][128]
-	new fileCount = 0
-	
-	new filename[128]
-	while (next_file(dir, filename, charsmax(filename)) && fileCount < MAX_QUEUE_FILES)
-	{
-		if (containi(filename, ".json") != -1)
-		{
-			copy(files[fileCount], charsmax(files[]), filename)
-			fileCount++
-		}
-	}
-	
-	close_dir(dir)
-	
-	// If too many files, delete oldest
-	if (fileCount >= MAX_QUEUE_FILES)
-	{
-		// Simple: delete first file
-		new filepath[256]
-		formatex(filepath, charsmax(filepath), "%s/%s", queuePath, files[0])
-		if (file_exists(filepath))
-		{
-			delete_file(filepath)
-		}
-	}
-}
-
 // Utility functions
 GetSteamID(player, output[], len)
 {
@@ -1239,9 +1420,21 @@ GetSteamID(player, output[], len)
 
 GetCurrentTimestamp()
 {
-	// Get Unix timestamp in milliseconds
-	new time = get_systime()
-	return time * 1000
+	return get_systime()
+}
+
+DebugLogToFile(const msg[], any:...)
+{
+	new buffer[512]
+	vformat(buffer, charsmax(buffer), msg, 2)
+	
+	new dataDir[128]
+	formatex(dataDir, charsmax(dataDir), "addons/amxmodx/data/stats_mod")
+	if (!dir_exists(dataDir)) mkdir(dataDir)
+	
+	new path[256]
+	formatex(path, charsmax(path), "%s/debug.log", dataDir)
+	log_to_file(path, buffer)
 }
 
 ValidateUUID(const uuid[])
@@ -1269,4 +1462,5 @@ ValidateUUID(const uuid[])
 	
 	return 1
 }
+
 
